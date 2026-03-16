@@ -2,16 +2,15 @@ const { execSync } = require("child_process");
 
 // ================= CONFIG =================
 
-// Docker paths
 const SWE = "./Swisseph-src/swetest";
-const EPHE = "./Swisseph-src/ephe";
+const EPHE = "./ephe";
 
 // Default: Delhi
 let LAT = 28.6139;
 let LON = 77.2090;
 const ALT = 0;
 
-// ================= LOCATION SETTER =================
+// ================= LOCATION =================
 
 function setLocation(lat, lon) {
   LAT = parseFloat(lat);
@@ -24,93 +23,140 @@ function run(cmd) {
   return execSync(cmd, { encoding: "utf8" });
 }
 
-// ------------------------------------------
-// JD from Date (UT)
-// ------------------------------------------
+// ================= DATE HELPERS =================
+
+function prevDate(dateStr) {
+  const [d, m, y] = dateStr.split(".").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() - 1);
+
+  const dd = String(dt.getUTCDate()).padStart(2, "0");
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const yy = dt.getUTCFullYear();
+
+  return `${dd}.${mm}.${yy}`;
+}
+
+// ================= JULIAN DAY =================
+
 function getJulianDay(dateStr) {
+
   const cmd =
     `"${SWE}" -b${dateStr} -ut00:00 -p0 -eswe -edir"${EPHE}"`;
 
   const out = run(cmd);
 
   const jdLine = out.split("\n").find(l => l.includes("UT:"));
-  if (!jdLine) {
-    console.log("JD RAW OUTPUT:\n", out);
-    throw new Error("JD parse failed");
-  }
+  if (!jdLine) throw new Error("JD parse failed");
 
   const match = jdLine.match(/UT:\s+([0-9.]+)/);
-  if (!match) {
-    console.log("JD LINE:", jdLine);
-    throw new Error("JD parse failed");
-  }
-
   return parseFloat(match[1]);
 }
 
-// ------------------------------------------
-// Helpers for rise/set parsing
-// ------------------------------------------
-function extractValidEventTime(out, eventName) {
+// ================= PARSE RISE/SET =================
 
-  const regex = new RegExp(
-    `${eventName}\\s+\\d+\\.\\d+\\.\\d+\\s+(\\d+:\\d+:\\d+\\.?\\d*)`,
-    "i"
-  );
+function parseRise(out) {
 
-  const match = out.match(regex);
+  const match =
+    out.match(/rise\s+(\d+\.\d+\.\d+)\s+(\d+:\d+:\d+\.\d+)/i);
 
-  if (match) return match[1];
+  if (!match) return null;
 
-  console.log(`${eventName.toUpperCase()} RAW OUTPUT:\n`, out);
-  throw new Error(`${eventName} parse failed`);
+  return {
+    date: match[1],
+    time: match[2]
+  };
 }
 
-// ------------------------------------------
-// Sunrise JD (UT)
-// ------------------------------------------
+function parseSet(out) {
+
+  const match =
+    out.match(/set\s+(\d+\.\d+\.\d+)\s+(\d+:\d+:\d+\.\d+)/i);
+
+  if (!match) return null;
+
+  return {
+    date: match[1],
+    time: match[2]
+  };
+}
+
+// ================= JD FROM TIME =================
+
+function jdFromTime(dateStr, timeStr) {
+
+  const jd = getJulianDay(dateStr);
+
+  const [h, m, s] = timeStr.split(":").map(Number);
+
+  return jd + (h + m / 60 + s / 3600) / 24;
+}
+
+// ================= SUNRISE =================
+
 function getSunriseJD(dateStr) {
-  const cmd =
-    `"${SWE}" -b${dateStr} -ut00:00 -rise -n2 -p0 ` +
+
+  // first attempt (normal cases)
+  let cmd =
+    `"${SWE}" -b${dateStr} -ut00:00 -rise -p0 ` +
     `-topo${LON},${LAT},${ALT} -eswe -edir"${EPHE}"`;
 
-  const out = run(cmd);
+  let out = run(cmd);
 
-  const timeStr = extractValidEventTime(out, "rise");
+  let rise = parseRise(out);
 
-  const jd = getJulianDay(dateStr);
-  const [h, m, s] = timeStr.split(":").map(Number);
+  // fallback when sunrise occurs before UTC midnight
+  if (!rise) {
 
-  return jd + (h + m / 60 + s / 3600) / 24;
+    const prev = prevDate(dateStr);
+
+    cmd =
+      `"${SWE}" -b${prev} -ut18:00 -rise -p0 ` +
+      `-topo${LON},${LAT},${ALT} -eswe -edir"${EPHE}"`;
+
+    out = run(cmd);
+
+    rise = parseRise(out);
+
+    if (!rise) {
+      console.log(out);
+      throw new Error("Sunrise parse failed");
+    }
+
+    return jdFromTime(rise.date, rise.time);
+  }
+
+  return jdFromTime(dateStr, rise.time);
 }
 
-// ------------------------------------------
-// Sunset JD (UT)
-// ------------------------------------------
+// ================= SUNSET =================
+
 function getSunsetJD(dateStr) {
+
   const cmd =
-    `"${SWE}" -b${dateStr} -ut00:00 -rise -n2 -p0 ` +
+    `"${SWE}" -b${dateStr} -ut00:00 -rise -p0 ` +
     `-topo${LON},${LAT},${ALT} -eswe -edir"${EPHE}"`;
 
   const out = run(cmd);
 
-  const timeStr = extractValidEventTime(out, "set");
+  const set = parseSet(out);
 
-  const jd = getJulianDay(dateStr);
-  const [h, m, s] = timeStr.split(":").map(Number);
+  if (!set) {
+    console.log(out);
+    throw new Error("Sunset parse failed");
+  }
 
-  return jd + (h + m / 60 + s / 3600) / 24;
+  return jdFromTime(dateStr, set.time);
 }
 
-// ------------------------------------------
-// Proper Lahiri Sidereal Longitude
-// ------------------------------------------
+// ================= LONGITUDE =================
 
 function dmsToDecimal(d, m, s) {
   return d + m / 60 + s / 3600;
 }
 
 function getLongitude(planet, jd) {
+
   const cmd =
     `"${SWE}" -bj${jd} -ut -p${planet} ` +
     `-eswe -sid1 -edir"${EPHE}"`;
@@ -124,14 +170,15 @@ function getLongitude(planet, jd) {
     .find(l => l.trim().startsWith(name));
 
   if (!line) {
-    console.log("LONGITUDE RAW OUTPUT:\n", out);
+    console.log(out);
     throw new Error("Longitude parse failed");
   }
 
-  const match = line.match(/(-?\d+)\s*°\s*(\d+)'\s*([\d.]+)/);
+  const match =
+    line.match(/(-?\d+)°\s*(\d+)'\s*([\d.]+)/);
 
   if (!match) {
-    console.log("FAILED LINE:", line);
+    console.log(line);
     throw new Error("DMS parse failed");
   }
 
@@ -142,9 +189,7 @@ function getLongitude(planet, jd) {
   return (dmsToDecimal(deg, min, sec) + 360) % 360;
 }
 
-// ------------------------------------------
-// Public API
-// ------------------------------------------
+// ================= PUBLIC API =================
 
 function sunAt(jd) {
   return getLongitude(0, jd);
